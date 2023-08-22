@@ -4,6 +4,7 @@ import base64
 import datetime
 import os.path
 import re
+from time import sleep
 
 import pandas as pd
 from google.auth.transport.requests import Request
@@ -14,7 +15,11 @@ from googleapiclient.errors import HttpError
 
 SCOPES = ['https://mail.google.com/']
 
-data = pd.DataFrame(columns=['subject', 'sender', 'date', 'snippet', 'body', 'replied_to'])
+data = pd.DataFrame(columns=['subject', 'sender', 'date', 'snippet', 'body', 'unread', 'replied_to', 'reply_msg'])
+
+def get_my_email(service):
+    profile = service.users().getProfile(userId='me').execute()
+    return profile['emailAddress']
 
 def getSubject(msg):
 	subject = ''
@@ -28,6 +33,8 @@ def getSender(msg):
 	for item in msg['payload']['headers']:
 		if item['name'] == 'From':
 			sender = item['value']
+	#remove the name from the sender and only send the email (encased in < >)
+	sender = re.sub(r'.+<(.+)>', r'\1', sender)
 	return sender
 
 def getSnippet(msg):
@@ -54,8 +61,6 @@ def getBody(msg):
 
 	return body
 
-	return body
-
 def getDate(msg):
 	for header in msg['payload']['headers']:
 		if header['name'] == 'Received':
@@ -70,20 +75,32 @@ def getDate(msg):
 			return date
 
 def repliedTo(service, msg):
-	#get the thread id of the message
+    #if i replied to the original sender, return 1, else return 0
 	threadId = msg['threadId']
-
-	#get all messages in the thread
 	thread = service.users().threads().get(userId='me', id=threadId).execute()
-	
-	original_sender = getSender(msg)
-
+	original_sender = get_my_email(service)
 	for message in thread['messages']:
-		if getRecipient(message) == original_sender:
+		if original_sender in getSender(message):
 			return 1
-		
 	return 0
 
+def unread(msg):
+	if 'UNREAD' in msg['labelIds']:
+		return 1
+	else:
+		return 0
+
+def getReplyMessage(service, msg):
+    #return the first reply that i sent to the sender
+	threadId = msg['threadId']
+	thread = service.users().threads().get(userId='me', id=threadId).execute()
+	original_sender = get_my_email(service)
+
+	for message in thread['messages']:
+		if original_sender in getSender(message):
+			return getBody(message)
+	return ''
+			
 def login():
 	creds = None
 	print('Checking credentials...')
@@ -108,13 +125,19 @@ def save_first_five_hundred_messages(service, creds):
 	msg_num = 0
 	for message in messages:
 		msg_num += 1
-		msg = service.users().messages().get(userId='me', id=message['id']).execute()
-		print(getDate(msg))
-		#append data to dataframe
+		try:
+			msg = service.users().messages().get(userId='me', id=message['id']).execute()
+		except TimeoutError:
+			print("Timed out. Sleeping for a minute and trying again...")
+			sleep(60)
+			msg = service.users().messages().get(userId='me', id=message['id']).execute()
 		replied_to = repliedTo(service, msg)
-		data.loc[len(data)] = [getSubject(msg), getSender(msg), getDate(msg), getSnippet(msg), getBody(msg), replied_to] # type: ignore
-		#save as parquet file
-		data.to_parquet('data_unembedded.parquet')
+		if replied_to == 1:
+			reply_msg = getReplyMessage(service, msg)
+		else:
+			reply_msg = ''
+		data.loc[len(data)] = [getSubject(msg), getSender(msg), getDate(msg), getSnippet(msg), getBody(msg), unread(msg), replied_to, reply_msg] # type: ignore
+		data.to_parquet('saloni_data_extra.parquet')
 		print(f'Saved row %d, with repliedTo value of %d' % (msg_num, replied_to))
 
 	next_page_token = results.get('nextPageToken')
@@ -129,13 +152,19 @@ def save_five_hundred_messages(service, next_page_token, batch_num):
 	msg_num = batch_num * 500
 	for message in messages:
 		msg_num += 1
-		msg = service.users().messages().get(userId='me', id=message['id']).execute()
-		print(getDate(msg))	
-		#append data to dataframe
+		try:
+			msg = service.users().messages().get(userId='me', id=message['id']).execute()
+		except TimeoutError:
+			print("Timed out. Sleeping for a minute and trying again...")
+			sleep(60)
+			msg = service.users().messages().get(userId='me', id=message['id']).execute()
 		replied_to = repliedTo(service, msg)
-		data.loc[len(data)] = [getSubject(msg), getSender(msg), getDate(msg), getSnippet(msg), getBody(msg), replied_to] # type: ignore
-		#save as parquet file
-		data.to_parquet('data_unembedded.parquet')
+		if replied_to == 1:
+			reply_msg = getReplyMessage(service, msg)
+		else:
+			reply_msg = ''
+		data.loc[len(data)] = [getSubject(msg), getSender(msg), getDate(msg), getSnippet(msg), getBody(msg), unread(msg), replied_to, reply_msg] # type: ignore
+		data.to_parquet('saloni_data_extra.parquet')
 		print(f'Saved row %d, with repliedTo value of %d' % (msg_num, replied_to))
 
 	next_page_token = results.get('nextPageToken')
@@ -147,6 +176,8 @@ def main():
 
 	try:
 		service = build('gmail', 'v1', credentials=creds)
+
+		print(f'Logged in as {get_my_email(service)}')
 		
 		print('Saving batch 1...')
 		next_page_token = save_first_five_hundred_messages(service, creds)
